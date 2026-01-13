@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QFrame, QDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QCoreApplication
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon
 
 from core.scanner import DirectoryScanner
@@ -34,11 +34,25 @@ class ScanWorker(QThread):
     finished = pyqtSignal(dict)  # scan statistics
     error = pyqtSignal(str)  # error message
     log = pyqtSignal(str)  # log message
+    progress = pyqtSignal(int, str, object)  # files_count, current_file, total_size (object para suportar int64+)
     
     def __init__(self, source_path: Path, source_files_list: List[str] = None):
         super().__init__()
         self.source_path = source_path
         self.source_files_list = source_files_list
+    
+    def _progress_callback(self, files_count: int, current_file: str, total_size):
+        """Callback de progresso do scanner."""
+        # CORREÇÃO: Valida total_size antes de emitir
+        try:
+            safe_total = int(max(0, total_size)) if isinstance(total_size, (int, float)) else 0
+        except (ValueError, TypeError, OverflowError):
+            safe_total = 0
+        
+        # Emite sinal de progresso (thread-safe)
+        self.progress.emit(files_count, current_file, safe_total)
+        # Processa eventos do Qt para manter UI responsiva
+        QCoreApplication.processEvents()
     
     def run(self):
         """Executa o escaneamento."""
@@ -49,10 +63,25 @@ class ScanWorker(QThread):
             if self.source_files_list:
                 total_size = 0
                 total_files = len(self.source_files_list)
-                for file_path in self.source_files_list:
+                for idx, file_path in enumerate(self.source_files_list, 1):
                     path = Path(file_path)
                     if path.exists() and path.is_file():
-                        total_size += path.stat().st_size
+                        try:
+                            file_size = path.stat().st_size
+                            # CORREÇÃO: Valida file_size e previne overflow
+                            if file_size < 0:
+                                file_size = 0
+                            if total_size + file_size >= total_size:  # Previne overflow
+                                total_size += file_size
+                        except (OSError, PermissionError):
+                            file_size = 0
+                        except Exception:
+                            file_size = 0
+                        
+                        # Emite progresso a cada arquivo (com valor seguro)
+                        safe_total = max(0, total_size)
+                        self.progress.emit(idx, str(path), safe_total)
+                        QCoreApplication.processEvents()
                 
                 stats = {
                     'total_files': total_files,
@@ -60,7 +89,7 @@ class ScanWorker(QThread):
                     'total_size': total_size
                 }
             else:
-                scanner = DirectoryScanner(self.source_path)
+                scanner = DirectoryScanner(self.source_path, self._progress_callback)
                 stats = scanner.scan()
             
             self.log.emit(f"Escaneamento concluído: {stats['total_files']} arquivo(s) encontrado(s)")
@@ -205,8 +234,13 @@ class CopyWorker(QThread):
             self.start_time = datetime.now()
             self.log.emit(f"Iniciando cópia de {self.source} para {self.destination}")
             
-            # Calcula tamanho total primeiro
-            scanner = DirectoryScanner(self.source)
+            # Calcula tamanho total primeiro (com progresso)
+            def scan_progress_callback(files_count: int, current_file: str, total_size: int):
+                # Emite progresso de escaneamento
+                self.log.emit(f"Escaneando... {files_count} arquivo(s) encontrado(s)")
+                QCoreApplication.processEvents()
+            
+            scanner = DirectoryScanner(self.source, scan_progress_callback)
             stats = scanner.scan()
             self.total_size = stats['total_size']
             
@@ -267,7 +301,12 @@ class VerifyWorker(QThread):
         try:
             self.log.emit("Iniciando verificação de integridade...")
             
-            scanner = DirectoryScanner(self.source)
+            # Callback de progresso durante escaneamento
+            def scan_progress_callback(files_count: int, current_file: str, total_size: int):
+                self.log.emit(f"Escaneando origem... {files_count} arquivo(s)")
+                QCoreApplication.processEvents()
+            
+            scanner = DirectoryScanner(self.source, scan_progress_callback)
             source_stats = scanner.scan()
             source_files = source_stats['files']
             
@@ -342,6 +381,7 @@ class MainWindow(QMainWindow):
         self.num_threads = max(2, min(8, cpu_count - 1))
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_file_progress)
+        self.update_timer.setSingleShot(False)  # Timer contínuo
         self.init_ui()
         self.apply_styles()
     
@@ -666,8 +706,21 @@ class MainWindow(QMainWindow):
             }
         """)
     
-    def format_size(self, size_bytes: int) -> str:
+    def format_size(self, size_bytes) -> str:
         """Formata tamanho em bytes para formato legível."""
+        # CORREÇÃO: Valida e garante valor não-negativo
+        try:
+            if isinstance(size_bytes, (int, float)):
+                size_bytes = max(0, float(size_bytes))  # Garante não-negativo e converte para float
+            else:
+                size_bytes = 0.0
+        except (ValueError, TypeError, OverflowError):
+            size_bytes = 0.0
+        
+        # Se for zero ou negativo, retorna zero
+        if size_bytes <= 0:
+            return "0.00 B"
+        
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size_bytes < 1024.0:
                 return f"{size_bytes:.2f} {unit}"
@@ -857,6 +910,7 @@ class MainWindow(QMainWindow):
             self.scan_worker.finished.connect(self.on_scan_finished)
             self.scan_worker.error.connect(self.on_scan_error)
             self.scan_worker.log.connect(self.log)
+            self.scan_worker.progress.connect(self.on_scan_progress)
             self.scan_worker.start()
             
         except Exception as e:
@@ -865,6 +919,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erro", error_msg)
             self.status_label.setText("Erro no escaneamento")
             self.scan_btn.setEnabled(True)
+    
+    def on_scan_progress(self, files_count: int, current_file: str, total_size):
+        """Callback de progresso durante escaneamento."""
+        # CORREÇÃO: Valida e converte total_size para int seguro
+        try:
+            # Converte para int se necessário e valida
+            if isinstance(total_size, (int, float)):
+                safe_total = int(max(0, total_size))  # Garante não-negativo
+            else:
+                safe_total = 0
+        except (ValueError, TypeError, OverflowError):
+            safe_total = 0
+        
+        # Atualiza UI em tempo real
+        self.files_label.setText(f"Arquivos: {files_count}")
+        self.total_label.setText(f"Total: {self.format_size(safe_total)}")
+        self.status_label.setText(f"Escaneando... {files_count} arquivo(s) encontrado(s)")
+        
+        # Força atualização da UI
+        QCoreApplication.processEvents()
     
     def on_scan_finished(self, stats: dict):
         """Callback quando escaneamento termina."""
@@ -879,6 +953,9 @@ class MainWindow(QMainWindow):
         self.log(f"Tamanho total: {self.format_size(self.total_size)}")
         self.status_label.setText("Escaneamento concluído")
         self.scan_btn.setEnabled(True)
+        
+        # Força atualização final
+        QCoreApplication.processEvents()
     
     def on_scan_error(self, error_msg: str):
         """Callback de erro no escaneamento."""
@@ -941,8 +1018,8 @@ class MainWindow(QMainWindow):
             self.remaining_label.setText(f"Restante: {self.format_size(self.total_size)}")
             self.speed_label.setText("Velocidade: --")
             
-            # Inicia timer de atualização
-            self.update_timer.start(200)  # Atualiza a cada 200ms
+            # Inicia timer de atualização (intervalo menor para atualização mais frequente)
+            self.update_timer.start(100)  # Atualiza a cada 100ms para UI mais responsiva
             
             # Cria worker thread (múltiplos arquivos ou arquivo/diretório único)
             if self.source_files_list:
@@ -983,8 +1060,9 @@ class MainWindow(QMainWindow):
         row = self.files_table.rowCount()
         self.files_table.insertRow(row)
         
-        # Nome do arquivo
+        # Nome do arquivo (armazena caminho completo como dado do item para mapeamento)
         name_item = QTableWidgetItem(Path(filename).name)
+        name_item.setData(Qt.UserRole, filename)  # Armazena caminho completo para mapeamento
         self.files_table.setItem(row, 0, name_item)
         
         # Tamanho
@@ -1029,6 +1107,9 @@ class MainWindow(QMainWindow):
         
         # Scroll para última linha
         self.files_table.scrollToBottom()
+        
+        # Força atualização imediata da UI
+        QCoreApplication.processEvents()
     
     def on_file_finished(self, filename: str, success: bool):
         """Callback quando um arquivo termina cópia."""
@@ -1055,19 +1136,36 @@ class MainWindow(QMainWindow):
     
     def update_file_progress(self):
         """Atualiza progresso dos arquivos na tabela."""
-        # Cria mapeamento de nome de arquivo para linha
+        # Cria mapeamento de caminho completo para linha (mais eficiente e preciso)
         filename_to_row = {}
         for row in range(self.files_table.rowCount()):
             name_item = self.files_table.item(row, 0)
             if name_item:
-                filename_to_row[name_item.text()] = row
+                # Usa o caminho completo armazenado no UserRole, ou o texto como fallback
+                full_path = name_item.data(Qt.UserRole)
+                if full_path:
+                    filename_to_row[full_path] = row
+                else:
+                    # Fallback: usa o texto do item
+                    filename_to_row[name_item.text()] = row
         
         # Atualiza cada arquivo na lista de progresso
         for filename, item in self.file_progress_items.items():
-            file_name = Path(filename).name
-            if file_name in filename_to_row:
-                row = filename_to_row[file_name]
-                
+            # Procura pela linha usando o caminho completo
+            row = filename_to_row.get(filename)
+            
+            # Se não encontrou pelo caminho completo, tenta pelo nome do arquivo
+            if row is None:
+                file_name = Path(filename).name
+                for r in range(self.files_table.rowCount()):
+                    name_item = self.files_table.item(r, 0)
+                    if name_item and name_item.text() == file_name:
+                        row = r
+                        # Atualiza o UserRole para facilitar próximas buscas
+                        name_item.setData(Qt.UserRole, filename)
+                        break
+            
+            if row is not None:
                 # Atualiza progresso
                 if item.size > 0:
                     # CORREÇÃO: Garante que bytes_copied não exceda size e progresso seja válido
@@ -1117,6 +1215,10 @@ class MainWindow(QMainWindow):
                     else:
                         status_item.setText("⏳ Copiando")
                         status_item.setForeground(QColor("#64B5F6"))
+        
+        # Força atualização visual da tabela
+        self.files_table.viewport().update()
+        QCoreApplication.processEvents()
     
     def cancel_operation(self):
         """Cancela a operação em andamento."""
@@ -1229,9 +1331,8 @@ class MainWindow(QMainWindow):
             self.files_label.setText(f"Arquivos: {current} / {total}")
             self.status_label.setText(f"Copiando: {Path(filename).name}")
             
-            # CORREÇÃO: Não atualiza tabela imediatamente (deixa o timer fazer isso)
-            # Isso reduz overhead e melhora performance
-            # self.update_file_progress()  # Removido - timer já faz isso
+            # CORREÇÃO: Força atualização imediata da UI e processa eventos
+            QCoreApplication.processEvents()
     
     def update_files_table(self):
         """Atualiza tabela de arquivos imediatamente."""
