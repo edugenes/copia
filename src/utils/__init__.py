@@ -1,0 +1,4 @@
+"""
+Módulo utils - Utilitários e funções auxiliares
+"""
+

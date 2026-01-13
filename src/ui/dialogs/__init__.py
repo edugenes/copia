@@ -1,0 +1,4 @@
+"""
+Diálogos da interface gráfica
+"""
+

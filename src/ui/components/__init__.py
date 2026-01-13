@@ -1,0 +1,4 @@
+"""
+Componentes da interface gráfica
+"""
+
